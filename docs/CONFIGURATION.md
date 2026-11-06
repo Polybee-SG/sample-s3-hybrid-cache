@@ -122,17 +122,18 @@ header; it is never queued. AWS SDKs retry 503 responses with backoff.
 
 #### Memory impact
 
-A streamed transfer uses a fixed amount of memory whatever the object size:
+A streamed cache hit whose client reads more slowly than the disk holds about 3.9 MiB, whatever the object size. The proxy reads the cached range in 512 KiB chunks into a queue of four, and hyper's write queue holds about 400 KiB more. A range smaller than one chunk is read into a buffer of its own size. The 3.9 MiB is measured. With 16 clients that request a 32 MiB cached object and stop reading after the response head, the heap grows by 4,017 KiB per hit. A cache miss whose client stops reading holds about 46 KiB, measured the same way with the object not cached and a test origin in place of S3.
 
-- Cache hit read from one whole cached extent: about `2 × cache.disk_streaming_queue_depth + 4` chunks of `cache.disk_streaming_chunk_size`, counting the HTTP write buffer, plus under 1 MiB for the disk reader. That is about 12.5 MiB at the defaults (1 MiB chunks, depth 4), and the full amount is held only while the client reads more slowly than the disk. See [Disk streaming chunk size and queue depth](#disk-streaming-chunk-size-and-queue-depth).
-- Cache miss: a 1 MiB receive buffer plus up to 4 MiB of pending cache writes.
+These figures are derived from the code, not measured:
 
-A range file written with 4 MiB LZ4 blocks holds about 8.25 MiB of decoder state per hit, which these figures omit. The proxy writes 64 KiB blocks and reads the larger ones; see [Compression](COMPRESSION.md).
+- A cache miss whose cache write stalls can queue up to 100 frames from S3 for the cache, of up to 408 KiB each, so about 40 MiB. Frames from S3 may be smaller.
+- A hit on a range file written with 4 MiB LZ4 blocks holds about 8.25 MiB of decoder state on top of the hit figure above. The proxy writes 64 KiB blocks and reads the larger ones; see [Compression](COMPRESSION.md).
+- A hit served from several cached ranges in turn reads each of them the same way, so it is expected to hold about 3.9 MiB too.
 
 Size three memory budgets together. They add up, none covers another, and nothing enforces a
 combined ceiling:
 
-1. Streamed transfers: at most `max_concurrent_requests` × the per-transfer figure above.
+1. Streamed transfers: about `max_concurrent_requests` × 3.9 MiB per proxy if every request is a streamed hit with a slow client. A miss with a slow client holds about 46 KiB, and one whose cache write stalls can hold up to about 40 MiB.
 2. Buffered bodies, on the paths that hold a whole body or range in memory: bounded by
    [`server.max_inflight_buffer_bytes`](#in-flight-memory-ceiling). At its default of `0`
    this budget has no bound.
@@ -349,6 +350,17 @@ When `true`, a client can bypass the cache for a single request by sending
 `Cache-Control: no-cache`, `Cache-Control: no-store`, or `Pragma: no-cache`. Set it to
 `false` to ignore those headers, so no client can force a cache bypass. See
 [Cache bypass headers](CACHING.md#cache-bypass-headers).
+
+### Ranges with no file identity
+
+```yaml
+cache:
+  trust_unverified_ranges: false  # default
+```
+
+**`cache.trust_unverified_ranges`** (`bool`, default `false`) applies to every bucket. A range whose cached metadata or pending journal entry records no file identity may hold another object version's bytes, and every range a 2.x release cached is such a range. At `false` the proxy refuses such a range, fetches it from S3 and caches it again with an identity, counted in [`atomic_metadata.unverified_ranges_refused`](METRICS_REFERENCE.md#atomic_metadata). It also discards a part layout that carries no version mark, as every layout a 2.x release or 3.0.0 recorded does, and fetches each of its parts from S3 once. See [Cache integrity](../SECURITY.md#cache-integrity).
+
+Set `true` only where objects are never overwritten in place outside the proxy, to keep a cache volume that a 2.x release populated warm after upgrading. `true` serves those ranges and keeps those part layouts. It also serves ranges that a 2.x release from public 1.9.7 may have stored from an error reply. An S3 XML error reply is still refused. A non-XML error body, such as an intermediary's HTML error page or an S3-compatible origin's JSON error, is served as object data. Every other check stays on. Ranges that record a file identity are still checked, fills of another version are still dropped, and the RAM cache still checks the cache volume's metadata. A range with no identity that starts at an object's first byte and ends before its last is still fetched again.
 
 ## Time-to-live (TTL) configuration
 
@@ -787,18 +799,6 @@ cache:
 ```
 
 A cached range at or above this size is streamed from disk in chunks instead of being read into memory whole. RAM cache hits are served from memory whatever this setting. Lower it when memory is short and many large ranges are served at once.
-
-### Disk streaming chunk size and queue depth
-
-```yaml
-cache:
-  disk_streaming_chunk_size: 1048576  # 1 MiB (default)
-  disk_streaming_queue_depth: 4       # (default)
-```
-
-A cache hit streamed from disk passes its bytes through two queues: from the disk reader to the response task, and from the response task to the HTTP connection. `disk_streaming_queue_depth` is how many chunks each queue holds before the stage feeding it waits. `disk_streaming_chunk_size` is the chunk size for a read of one whole cached extent; reads that slice or chain extents use 256 KiB chunks. Against a client that reads more slowly than the disk, a hit holds about `(2 × depth + 4) × chunk`, counting the HTTP write buffer, plus under 1 MiB for the disk reader: measured at 12.4 MiB at the defaults and 2.9 MiB at 256 KiB and depth 2 (`tests/hit_stream_memory_test.rs`).
-
-The chunk size does not set the size of disk reads, which go through a reader buffer of up to 256 KiB, so a smaller chunk changes only how the decoded bytes are handed on. On local NVMe, 256 KiB and depth 2 served cache hits at least as fast as the defaults (`tests/hit_stream_throughput_test.rs`). The ranges are `65536` (64 KiB) to `16777216` (16 MiB) for the chunk size and 1 to 64 for the depth, and startup rejects a value outside them.
 
 ### Compression batch size
 

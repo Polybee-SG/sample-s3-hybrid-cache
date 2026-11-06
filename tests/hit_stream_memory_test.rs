@@ -1,20 +1,20 @@
 //! Heap held by a cache hit streamed from disk to a client that is not reading.
 //!
-//! A hit served from one whole cached extent runs two queues between the disk and the
-//! socket: the blocking reader's channel (`DiskCacheManager::stream_range_data_from_queued`)
-//! and the response body's frame channel (`serve_range_from_cache`). Against a client that has
-//! stopped reading, both fill, so the request holds about `(2 × depth + 4) × chunk` bytes: each
-//! queue's chunks, the chunk each queue's sender is waiting to hand on, the reader's decode
-//! buffer, and hyper's write queue, which takes frames until it holds more than
-//! `DEFAULT_MAX_BUFFER_SIZE` (about 400 KiB, `hyper/src/proto/h1/io.rs`). At the shipped 1 MiB
-//! chunk and depth 4 that is about 12 MiB per stalled hit;
-//! `cache.disk_streaming_chunk_size` and `cache.disk_streaming_queue_depth` size it.
+//! A hit streamed from disk runs one queue between the disk and the socket: the blocking
+//! reader's channel (`DiskCacheManager::stream_range_data_from`), `STREAM_QUEUE_DEPTH` chunks
+//! of `STREAMED_HIT_CHUNK_SIZE` (512 KiB) deep. The response body wraps the disk stream
+//! directly (`StreamedHitFrames`). Against a client that has stopped reading, a hit holds the
+//! queued chunks, the chunk the reader is waiting to send, the LZ4 reader's buffer, and hyper's
+//! write queue, which takes frames until it holds more than `DEFAULT_MAX_BUFFER_SIZE` (about
+//! 400 KiB, `hyper/src/proto/h1/io.rs`). 3.0.0 also ran a 4-deep relay channel and 1 MiB chunks
+//! on this arm, about 12.4 MiB per stalled hit.
 //!
-//! The test opens `STREAMS` such hits against one proxy at each setting, waits until the heap
-//! stops growing, and compares the live heap per hit. Harness copied from
-//! `tests/buffered_serve_memory_bound_test.rs`. The allocator counters are process-global, so
-//! this binary holds one test.
-
+//! The test opens `STREAMS` such requests against one proxy per case, waits until the heap
+//! stops growing, and reports the live heap per request: a hit at depths 1, 2 and 4 (through
+//! the `set_stream_queue_depth_for_tests` seam) and at the build's depth, and a miss whose
+//! client stalls. A second test takes the peak heap of one stalled hit on a range smaller
+//! than a chunk (R14.1). Harness copied from `tests/buffered_serve_memory_bound_test.rs`. The
+//! allocator counters and the depth seam are process-global, so the tests take one lock.
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -50,6 +50,12 @@ use common::{StubResponse, StubS3Client};
 struct CountingAlloc;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// The highest `LIVE` since a test last stored into it.
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn note_live(live: usize) {
+    PEAK.fetch_max(live, Ordering::Relaxed);
+}
 
 // SAFETY: every method delegates to `System` with the caller's layout and only
 // adjusts one atomic on success.
@@ -57,7 +63,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = System.alloc(layout);
         if !p.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            note_live(LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size());
         }
         p
     }
@@ -65,7 +71,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let p = System.alloc_zeroed(layout);
         if !p.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            note_live(LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size());
         }
         p
     }
@@ -79,7 +85,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
         let p = System.realloc(ptr, layout, new_size);
         if !p.is_null() {
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-            LIVE.fetch_add(new_size, Ordering::Relaxed);
+            note_live(LIVE.fetch_add(new_size, Ordering::Relaxed) + new_size);
         }
         p
     }
@@ -90,7 +96,7 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
-/// Stalled hits held open at once at each setting.
+/// Stalled requests held open at once in each case.
 const STREAMS: usize = 16;
 /// Large enough that the socket buffers between proxy and client cannot absorb the object, so
 /// every stalled hit fills its queues.
@@ -101,7 +107,7 @@ const PATH: &str = "/mybucket/hit-stream-memory.bin";
 // Harness
 // ---------------------------------------------------------------------------
 
-fn test_config(cache_dir: std::path::PathBuf, chunk_size: usize, queue_depth: usize) -> Config {
+fn test_config(cache_dir: std::path::PathBuf) -> Config {
     let mut config = Config::default();
     config.cache.cache_dir = cache_dir;
     config.cache.download_coordination.enabled = false;
@@ -109,8 +115,6 @@ fn test_config(cache_dir: std::path::PathBuf, chunk_size: usize, queue_depth: us
     config.cache.bucket_settings_staleness_threshold = Duration::ZERO;
     config.cache.max_cache_size = 1024 * 1024 * 1024;
     config.cache.read_cache_enabled = true;
-    config.cache.disk_streaming_chunk_size = chunk_size;
-    config.cache.disk_streaming_queue_depth = queue_depth;
     config.server.max_concurrent_requests = 100;
     config
 }
@@ -293,14 +297,14 @@ async fn full_request(
 
 /// A GET of the whole cached extent whose client reads the response head and then stops
 /// reading. Its receive buffer is shrunk so the kernel holds little of the body for it.
-async fn stalled_hit(addr: SocketAddr) -> TcpStream {
+async fn stalled_get(addr: SocketAddr, start: usize, size: usize, expect_hit: bool) -> TcpStream {
     let socket = TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(4096).unwrap();
     let mut stream = socket.connect(addr).await.unwrap();
     let request = format!(
         "GET {PATH} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {AUTHORIZATION}\r\n\
-         Range: bytes=0-{}\r\n\r\n",
-        OBJECT_SIZE - 1
+         Range: bytes={start}-{}\r\n\r\n",
+        size - 1
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut head = Vec::new();
@@ -314,10 +318,17 @@ async fn stalled_hit(addr: SocketAddr) -> TcpStream {
         head.push(byte[0]);
     }
     let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
-    assert!(head.starts_with("http/1.1 206"), "stalled GET: {head}");
-    assert!(
+    let want = if expect_hit {
+        "http/1.1 206"
+    } else {
+        "http/1.1 200"
+    };
+    assert!(head.starts_with(want), "stalled GET: {head}");
+    assert_eq!(
         head.contains("x-cache: hit"),
-        "stalled GET must be a hit: {head}"
+        expect_hit,
+        "stalled GET must be a {}: {head}",
+        if expect_hit { "hit" } else { "miss" }
     );
     stream
 }
@@ -340,14 +351,21 @@ async fn settled_live() -> usize {
     LIVE.load(Ordering::Relaxed)
 }
 
-/// Live heap per stalled hit for one setting, on a proxy of its own.
-async fn heap_per_stalled_hit(chunk_size: usize, queue_depth: usize) -> usize {
+/// What the stalled requests of one measurement read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Case {
+    /// A hit on the range file the proxy wrote.
+    Hit,
+    /// A hit on all but the first byte of that range file: the slice arm.
+    Slice,
+    /// A miss: the cache is cold, every request fetches from the stub and fills the cache.
+    Miss,
+}
+
+/// Live heap per stalled request for one case, on a proxy of its own.
+async fn heap_per_stalled_get(case: Case) -> usize {
     let dir = TempDir::new().unwrap();
-    let config = Arc::new(test_config(
-        dir.path().to_path_buf(),
-        chunk_size,
-        queue_depth,
-    ));
+    let config = Arc::new(test_config(dir.path().to_path_buf()));
     let (cache_manager, range_handler) = make_cache_infra(&config).await;
     let body = incompressible_body(OBJECT_SIZE);
     let server = spawn_proxy_server(
@@ -356,7 +374,7 @@ async fn heap_per_stalled_hit(chunk_size: usize, queue_depth: usize) -> usize {
         range_handler,
         StubS3Client::new()
             .with_default(
-                StubResponse::ok(body)
+                StubResponse::ok(body.clone())
                     .with_header("etag", "\"hit-stream-etag\"")
                     .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
                     .with_header("content-type", "application/octet-stream"),
@@ -364,33 +382,34 @@ async fn heap_per_stalled_hit(chunk_size: usize, queue_depth: usize) -> usize {
             .into_trait_object(),
     )
     .await;
-
-    let (status, _, len) = full_request(server.addr, None).await;
-    assert!(status.is_success(), "warm GET: {status}");
-    assert_eq!(len, OBJECT_SIZE);
-    // The disk write may land just after the warm response ends.
-    let whole = format!("bytes=0-{}", OBJECT_SIZE - 1);
-    let mut cached = false;
-    for _ in 0..100 {
-        if let (StatusCode::PARTIAL_CONTENT, Some(hit), OBJECT_SIZE) =
-            full_request(server.addr, Some(&whole)).await
-        {
-            if hit == "HIT" {
-                cached = true;
-                break;
+    if case != Case::Miss {
+        let (status, _, len) = full_request(server.addr, None).await;
+        assert!(status.is_success(), "warm GET: {status}");
+        assert_eq!(len, OBJECT_SIZE);
+        // The disk write may land just after the warm response ends.
+        let whole = format!("bytes=0-{}", OBJECT_SIZE - 1);
+        let mut cached = false;
+        for _ in 0..100 {
+            if let (StatusCode::PARTIAL_CONTENT, Some(hit), OBJECT_SIZE) =
+                full_request(server.addr, Some(&whole)).await
+            {
+                if hit == "HIT" {
+                    cached = true;
+                    break;
+                }
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            cached,
+            "the cache never served {PATH} from disk after the warm GET"
+        );
     }
-    assert!(
-        cached,
-        "the cache never served {PATH} from disk after the warm GET"
-    );
-
+    let start = if case == Case::Slice { 1 } else { 0 };
     let base = settled_live().await;
     let mut held = Vec::with_capacity(STREAMS);
     for _ in 0..STREAMS {
-        held.push(stalled_hit(server.addr).await);
+        held.push(stalled_get(server.addr, start, OBJECT_SIZE, case != Case::Miss).await);
     }
     let growth = settled_live().await.saturating_sub(base);
     drop(held);
@@ -411,30 +430,212 @@ fn incompressible_body(len: usize) -> Bytes {
     Bytes::from(out)
 }
 
-/// A stalled hit at 256 KiB chunks and depth 2 holds under a third of the heap it holds at the
-/// shipped 1 MiB and depth 4.
-///
-/// Both figures are measured in the same process with the same object and client, so the
-/// comparison does not depend on the host. The absolute figures are printed rather than
-/// asserted: part of each chunk in flight sits in the kernel's socket buffer, so how many
-/// chunks are on the heap at once varies a little with the chunk size and the host.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stalled_hit_holds_its_two_queues_of_the_configured_chunk() {
-    let shipped = heap_per_stalled_hit(MIB, 4).await;
-    let small = heap_per_stalled_hit(256 * KIB, 2).await;
-    println!(
-        "{STREAMS} stalled hits of a {} MiB extent: live heap per hit {} KiB at 1 MiB / depth 4, \
-         {} KiB at 256 KiB / depth 2 ({:.1} x less)",
-        OBJECT_SIZE / MIB,
-        shipped / KIB,
-        small / KIB,
-        shipped as f64 / small.max(1) as f64
-    );
+/// hyper's HTTP/1 write queue takes frames until it holds more than this
+/// (`DEFAULT_MAX_BUFFER_SIZE`, 8 KiB + 100 x 4 KiB, `hyper/src/proto/h1/io.rs`), so it holds
+/// the fewest whole chunks that exceed it.
+const HYPER_WRITE_QUEUE: usize = 408 * KIB;
+/// The part of a stalled hit that does not scale with the chunk or the depth (the LZ4 reader's
+/// buffer, the frame decoder, the connection and the request): 433 KiB at both 256 KiB and
+/// 512 KiB chunks and at depths 1, 2 and 4 on the aarch64 build host, plus 207 KiB of margin,
+/// less than the two chunks a relay channel adds.
+const FIXED_OVERHEAD: usize = 640 * KIB;
 
+/// Bound on the live heap of one stalled hit at disk queue depth `depth`: the decode buffer,
+/// `depth` queued chunks and the one waiting in `blocking_send`, hyper's write queue, and the
+/// fixed part. A second queue between the disk and the socket (the relay 3.0.0 ran) adds at
+/// least two chunks at any depth and fails it.
+fn hit_bound(depth: usize) -> usize {
+    use s3_proxy::http_proxy::STREAMED_HIT_CHUNK_SIZE as CHUNK;
+    CHUNK * (depth + 2) + (HYPER_WRITE_QUEUE / CHUNK + 1) * CHUNK + FIXED_OVERHEAD
+}
+
+/// A stalled hit holds one queue of chunks on the exact and slice arms at depths 1, 2
+/// and 4: its live heap stays under `hit_bound(depth)`.
+///
+/// Also measures, and prints without asserting, a miss whose client stalls.
+///
+/// # RED SIDE
+///
+/// With a relay channel of depth 2 restored on the exact arm (a scratch build, 512 KiB chunks),
+/// stalled hits held 4,020, 4,532 and 5,556 KiB at depths 1, 2 and 4, over bounds of 2,688,
+/// 3,200 and 4,224 KiB: the relay added three chunks at every depth. At 3.0.0's constants
+/// (1 MiB chunks, a 4-deep relay after the 4-deep disk channel) a stalled hit held 12,728 KiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_hit_holds_one_queue_of_chunks() {
+    use s3_proxy::disk_cache::{set_stream_queue_depth_for_tests, STREAM_QUEUE_DEPTH};
+    use s3_proxy::http_proxy::STREAMED_HIT_CHUNK_SIZE;
+    let _serial = serial().await;
+    let mut figures = Vec::new();
+    for depth in [1, 2, 4] {
+        set_stream_queue_depth_for_tests(depth);
+        for case in [Case::Hit, Case::Slice] {
+            figures.push((depth, case, heap_per_stalled_get(case).await));
+        }
+    }
+    set_stream_queue_depth_for_tests(0);
+    let miss = heap_per_stalled_get(Case::Miss).await;
+    for (depth, case, heap) in &figures {
+        println!(
+            "HEAP {STREAMS} stalled {case:?} requests of a {} MiB object, chunk {} KiB, depth \
+             {depth}: {} KiB per request, bound {} KiB, beyond the chunk and depth terms {} KiB",
+            OBJECT_SIZE / MIB,
+            STREAMED_HIT_CHUNK_SIZE / KIB,
+            heap / KIB,
+            hit_bound(*depth) / KIB,
+            heap.saturating_sub(hit_bound(*depth) - FIXED_OVERHEAD) / KIB
+        );
+    }
+    println!(
+        "HEAP miss with a stalled client at the build's depth {STREAM_QUEUE_DEPTH}: {} KiB",
+        miss / KIB
+    );
+    for (depth, case, heap) in &figures {
+        assert!(
+            *heap < hit_bound(*depth),
+            "a stalled {case:?} hit at depth {depth} held {} KiB, over the {} KiB bound",
+            heap / KIB,
+            hit_bound(*depth) / KIB
+        );
+    }
+}
+
+/// Serialises this binary's tests: the allocator counters and the depth seam are process-global.
+static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// A cached range far smaller than one streamed-hit chunk.
+const SMALL_SIZE: usize = 16 * KIB;
+/// What one streamed hit allocates besides its own bytes, whatever the range's size. With the
+/// read buffer capped at the range (R14.1) a 16 KiB hit peaked at 226 KiB over the settled
+/// heap (least of 5, aarch64 build host), so about 210 KiB is fixed (measured, not attributed
+/// line by line); with a whole 256 KiB read buffer it peaked at 449 KiB.
+const SMALL_FIXED_OVERHEAD: usize = 256 * KIB;
+
+/// Peak heap growth while one stalled client holds a streamed hit on `len` bytes from `start`
+/// of an `object`-byte cached range: the least of five trials, since anything else the process
+/// allocates meanwhile can only raise a trial's peak.
+async fn peak_of_one_stalled_hit(object: usize, start: usize, len: usize) -> usize {
+    let dir = TempDir::new().unwrap();
+    let mut config = test_config(dir.path().to_path_buf());
+    // Below the threshold a hit is served buffered; this measures the streamed reader.
+    config.cache.disk_streaming_threshold = 1024;
+    let config = Arc::new(config);
+    let (cache_manager, range_handler) = make_cache_infra(&config).await;
+    let server = spawn_proxy_server(
+        config,
+        cache_manager,
+        range_handler,
+        StubS3Client::new()
+            .with_default(
+                StubResponse::ok(incompressible_body(object))
+                    .with_header("etag", "\"hit-stream-small-etag\"")
+                    .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+                    .with_header("content-type", "application/octet-stream"),
+            )
+            .into_trait_object(),
+    )
+    .await;
+    let (status, _, warm_len) = full_request(server.addr, None).await;
+    assert!(status.is_success(), "warm GET: {status}");
+    assert_eq!(warm_len, object);
+    let whole = format!("bytes=0-{}", object - 1);
+    let mut cached = false;
+    for _ in 0..100 {
+        if let (StatusCode::PARTIAL_CONTENT, Some(hit), n) =
+            full_request(server.addr, Some(&whole)).await
+        {
+            if hit == "HIT" && n == object {
+                cached = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(
-        small * 3 < shipped,
-        "a stalled hit held {} KiB at 256 KiB / depth 2 against {} KiB at 1 MiB / depth 4",
-        small / KIB,
-        shipped / KIB
+        cached,
+        "the cache never served the {object}-byte range from disk"
+    );
+    let mut least = usize::MAX;
+    for _ in 0..5 {
+        settled_live().await;
+        let base = LIVE.load(Ordering::Relaxed);
+        PEAK.store(base, Ordering::Relaxed);
+        let held = stalled_get(server.addr, start, start + len, true).await;
+        settled_live().await;
+        least = least.min(PEAK.load(Ordering::Relaxed).saturating_sub(base));
+        drop(held);
+    }
+    least
+}
+
+/// A streamed hit on a range smaller than one chunk allocates about its own size plus a fixed
+/// overhead, not a whole `STREAMED_HIT_CHUNK_SIZE` read buffer (R14.1).
+///
+/// # RED SIDE
+///
+/// With the reader's buffer sized at the chunk rather than the bytes left, the 16 KiB hit
+/// peaked at 449 KiB, over the 272 KiB bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_hit_on_a_small_range_allocates_about_its_own_size() {
+    let _serial = serial().await;
+    let peak = peak_of_one_stalled_hit(SMALL_SIZE, 0, SMALL_SIZE).await;
+    println!(
+        "SMALL one stalled streamed hit on a {} KiB range: peak {} KiB over the settled heap \
+         (least of 5)",
+        SMALL_SIZE / KIB,
+        peak / KIB
+    );
+    assert!(
+        peak < SMALL_SIZE + SMALL_FIXED_OVERHEAD,
+        "a stalled hit on a {} KiB range peaked at {} KiB, over its size plus {} KiB",
+        SMALL_SIZE / KIB,
+        peak / KIB,
+        SMALL_FIXED_OVERHEAD / KIB
+    );
+}
+
+/// The extent a small slice is cut from: past `BUFFERED_OPERATION_BOUND`, so the slice arm
+/// streams it.
+const LARGE_EXTENT: usize = 32 * MIB;
+/// Where in [`LARGE_EXTENT`] the small slice starts.
+const SLICE_AT: usize = 16 * MIB + 100 * KIB;
+/// What one streamed slice of [`LARGE_EXTENT`] allocates besides its own bytes. Larger than
+/// [`SMALL_FIXED_OVERHEAD`] because the LZ4 reader's buffer and frame decoder are sized by
+/// the 32 MiB file (`lz4_range_reader_capacity`), not the slice.
+const SLICE_FIXED_OVERHEAD: usize = 768 * KIB;
+
+/// A streamed hit on a 16 KiB slice of a 32 MiB extent allocates about the slice's own size
+/// plus a fixed overhead: the reader is given the response's end, discards up to the slice
+/// itself, and caps its buffer at the slice (R14.1).
+///
+/// # RED SIDE
+///
+/// With the response's end ignored (the buffer capped at the extent's remaining bytes and an
+/// LZ4 extent discarded up to the slice by the caller, as before the fix), the slice peaked at
+/// 1,456 KiB, over the 784 KiB bound; with it, 464 KiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_small_slice_of_a_large_extent_allocates_about_its_own_size() {
+    let _serial = serial().await;
+    let peak = peak_of_one_stalled_hit(LARGE_EXTENT, SLICE_AT, SMALL_SIZE).await;
+    println!(
+        "SLICE one stalled streamed {} KiB slice of a {} MiB extent: peak {} KiB over the \
+         settled heap (least of 5)",
+        SMALL_SIZE / KIB,
+        LARGE_EXTENT / MIB,
+        peak / KIB
+    );
+    assert!(
+        peak < SMALL_SIZE + SLICE_FIXED_OVERHEAD,
+        "a stalled {} KiB slice of a {} MiB extent peaked at {} KiB, over its size plus {} KiB",
+        SMALL_SIZE / KIB,
+        LARGE_EXTENT / MIB,
+        peak / KIB,
+        SLICE_FIXED_OVERHEAD / KIB
     );
 }

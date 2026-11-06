@@ -1,15 +1,22 @@
-//! Cache-hit throughput at two `cache.disk_streaming_chunk_size` / `disk_streaming_queue_depth`
-//! settings, through the proxy over loopback TCP.
+//! Cache-hit throughput and process CPU per GB served, for streamed-hit arms, one proxy per arm.
 //!
-//! `CLIENTS` keep-alive clients each read `REQUESTS` whole-extent range GETs of a
-//! FruitFox-sized object (2.4 MB, the mean detection read) from the cache as fast as they can.
-//! The two settings run alternately, `ROUNDS` times each, on two proxies of their own, and the
-//! medians are compared, so a slower or busier host moves both alike.
+//! A measurement, not a gate: it prints one `RUN` line per arm, load and round, and a summary
+//! per arm and load, and asserts nothing about the arms' ratio. The comparison that matters is
+//! against 3.0.0 (1 MiB chunks on the exact arm and a relay channel, which this tree no longer
+//! has) and is made across builds, so the same file runs on a 3.0.0 build with `apply_arm`'s
+//! body replaced by a no-op. Two loads, each on its own warmed proxy per arm:
 //!
-//! Ignored by default because it measures time; run it alone with
-//! `cargo test --release --test hit_stream_throughput_test -- --ignored --nocapture`.
-//! Harness copied from `tests/hit_stream_memory_test.rs`.
-
+//! - `small`: `SMALL_CLIENTS` concurrent clients each GET a cached `SMALL_OBJECT` object
+//!   `SMALL_REQUESTS` times;
+//! - `large`: `LARGE_CLIENTS` clients each GET a cached `LARGE_OBJECT` object `LARGE_REQUESTS`
+//!   times, the per-stream case.
+//!
+//! Arms alternate within each round. `HIT_STREAM_ARMS` lists them as `chunk_kib:depth` pairs
+//! separated by commas (default `0:1,0:2,0:4`; a chunk of 0 is the build's
+//! `STREAMED_HIT_CHUNK_SIZE`, the only chunk this tree can run), and `HIT_STREAM_ROUNDS` sets
+//! the rounds (default 7). The depth seam and the rusage counters are process-global, so this
+//! binary holds one test. Run it with `cargo test --release --test hit_stream_throughput_test
+//! -- --ignored --nocapture`. CPU is the whole process's, clients included, from `getrusage`.
 mod common;
 
 use std::net::SocketAddr;
@@ -36,19 +43,64 @@ use s3_proxy::S3ClientApi;
 
 use common::{StubResponse, StubS3Client};
 
-const KIB: usize = 1024;
-const MIB: usize = 1024 * KIB;
-const OBJECT_SIZE: usize = 2_400_000;
-const CLIENTS: usize = 32;
-const REQUESTS: usize = 40;
-const ROUNDS: usize = 7;
+const SMALL_OBJECT: usize = 2_400_000;
+const SMALL_CLIENTS: usize = 32;
+const SMALL_REQUESTS: usize = 40;
+const LARGE_OBJECT: usize = 64 * 1024 * 1024;
+const LARGE_CLIENTS: usize = 4;
+const LARGE_REQUESTS: usize = 8;
 const PATH: &str = "/mybucket/hit-stream-throughput.bin";
+
+// ---------------------------------------------------------------------------
+// Arms
+// ---------------------------------------------------------------------------
+
+/// One streamed-hit setting: a chunk size (0 for the build's) and a disk queue depth.
+#[derive(Clone, Debug)]
+struct Arm {
+    chunk_kib: usize,
+    depth: usize,
+}
+
+impl Arm {
+    fn label(&self) -> String {
+        format!("c{}d{}", self.chunk_kib, self.depth)
+    }
+}
+
+fn arms() -> Vec<Arm> {
+    let spec = std::env::var("HIT_STREAM_ARMS").unwrap_or_else(|_| "0:1,0:2,0:4".to_string());
+    spec.split(',')
+        .map(|pair| {
+            let (chunk, depth) = pair
+                .split_once(':')
+                .expect("HIT_STREAM_ARMS: chunk_kib:depth pairs");
+            Arm {
+                chunk_kib: chunk.trim().parse().expect("chunk_kib"),
+                depth: depth.trim().parse().expect("depth"),
+            }
+        })
+        .collect()
+}
+
+fn rounds() -> usize {
+    std::env::var("HIT_STREAM_ROUNDS")
+        .ok()
+        .map(|v| v.parse().expect("HIT_STREAM_ROUNDS"))
+        .unwrap_or(7)
+}
+
+/// Sets the process-global streamed-hit knobs for `arm`. This tree can set only the depth.
+fn apply_arm(arm: &Arm) {
+    assert_eq!(arm.chunk_kib, 0, "this build has no chunk-size seam");
+    s3_proxy::disk_cache::set_stream_queue_depth_for_tests(arm.depth);
+}
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
-fn test_config(cache_dir: std::path::PathBuf, chunk_size: usize, queue_depth: usize) -> Config {
+fn test_config(cache_dir: std::path::PathBuf) -> Config {
     let mut config = Config::default();
     config.cache.cache_dir = cache_dir;
     config.cache.download_coordination.enabled = false;
@@ -56,8 +108,6 @@ fn test_config(cache_dir: std::path::PathBuf, chunk_size: usize, queue_depth: us
     config.cache.bucket_settings_staleness_threshold = Duration::ZERO;
     config.cache.max_cache_size = 1024 * 1024 * 1024;
     config.cache.read_cache_enabled = true;
-    config.cache.disk_streaming_chunk_size = chunk_size;
-    config.cache.disk_streaming_queue_depth = queue_depth;
     config.server.max_concurrent_requests = 100;
     config
 }
@@ -181,7 +231,6 @@ async fn spawn_proxy_server(
                             }
                         });
 
-                        // A stalled client is dropped mid-body; that error is expected.
                         let _ = http1::Builder::new().serve_connection(io, service).await;
                     });
                 }
@@ -237,15 +286,11 @@ async fn get(
     (status, x_cache, len)
 }
 
-/// A proxy at one setting with the object cached on disk.
-async fn warmed_proxy(dir: &TempDir, chunk_size: usize, queue_depth: usize) -> ProxyServer {
-    let config = Arc::new(test_config(
-        dir.path().to_path_buf(),
-        chunk_size,
-        queue_depth,
-    ));
+/// A proxy with an `object_size` object cached on disk, in a directory of its own.
+async fn warmed_proxy(dir: &TempDir, object_size: usize) -> ProxyServer {
+    let config = Arc::new(test_config(dir.path().to_path_buf()));
     let (cache_manager, range_handler) = make_cache_infra(&config).await;
-    let body = incompressible_body(OBJECT_SIZE);
+    let body = incompressible_body(object_size);
     let server = spawn_proxy_server(
         config,
         cache_manager,
@@ -263,44 +308,62 @@ async fn warmed_proxy(dir: &TempDir, chunk_size: usize, queue_depth: usize) -> P
     let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
     let (status, _, len) = get(&client, server.addr, None).await;
     assert!(status.is_success(), "warm GET: {status}");
-    assert_eq!(len, OBJECT_SIZE);
+    assert_eq!(len, object_size);
+    let range = whole_range(object_size);
     for _ in 0..100 {
-        if let (StatusCode::PARTIAL_CONTENT, Some(hit), OBJECT_SIZE) =
-            get(&client, server.addr, Some(&whole_range())).await
-        {
-            if hit == "HIT" {
-                return server;
-            }
+        let (status, hit, len) = get(&client, server.addr, Some(&range)).await;
+        if status == StatusCode::PARTIAL_CONTENT && hit.as_deref() == Some("HIT") {
+            assert_eq!(len, object_size);
+            return server;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("the cache never served {PATH} from disk after the warm GET");
+    panic!("the cache never served the {object_size}-byte object from disk after the warm GET");
 }
 
-fn whole_range() -> String {
-    format!("bytes=0-{}", OBJECT_SIZE - 1)
+fn whole_range(object_size: usize) -> String {
+    format!("bytes=0-{}", object_size - 1)
 }
 
-/// MB/s (10^6 bytes) of `CLIENTS` × `REQUESTS` cache hits against `addr`.
-async fn hit_throughput(addr: SocketAddr) -> f64 {
+/// User plus system CPU seconds this process has used, from `getrusage`.
+fn process_cpu_seconds() -> f64 {
+    // SAFETY: `getrusage` writes only the struct it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    assert_eq!(rc, 0, "getrusage failed");
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    secs(usage.ru_utime) + secs(usage.ru_stime)
+}
+
+/// One load: (MB/s in 10^6 bytes, process CPU seconds per 10^9 bytes served).
+async fn hit_throughput(
+    addr: SocketAddr,
+    object_size: usize,
+    clients: usize,
+    requests: usize,
+) -> (f64, f64) {
+    let cpu_before = process_cpu_seconds();
     let started = Instant::now();
-    let mut tasks = Vec::with_capacity(CLIENTS);
-    for _ in 0..CLIENTS {
+    let mut tasks = Vec::with_capacity(clients);
+    for _ in 0..clients {
         tasks.push(tokio::spawn(async move {
             let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
-            let range = whole_range();
-            for _ in 0..REQUESTS {
+            let range = whole_range(object_size);
+            for _ in 0..requests {
                 let (status, x_cache, len) = get(&client, addr, Some(&range)).await;
                 assert_eq!(status, StatusCode::PARTIAL_CONTENT);
                 assert_eq!(x_cache.as_deref(), Some("HIT"));
-                assert_eq!(len, OBJECT_SIZE);
+                assert_eq!(len, object_size);
             }
         }));
     }
     for task in tasks {
         task.await.unwrap();
     }
-    (CLIENTS * REQUESTS * OBJECT_SIZE) as f64 / started.elapsed().as_secs_f64() / 1e6
+    let elapsed = started.elapsed().as_secs_f64();
+    let cpu = process_cpu_seconds() - cpu_before;
+    let bytes = (clients * requests * object_size) as f64;
+    (bytes / elapsed / 1e6, cpu / (bytes / 1e9))
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -322,33 +385,67 @@ fn incompressible_body(len: usize) -> Bytes {
     Bytes::from(out)
 }
 
-/// Cache hits at 256 KiB chunks and depth 2 are served at least 97% as fast as at the shipped
-/// 1 MiB and depth 4 (the median of `ROUNDS` alternating runs each).
+/// Cache-hit MB/s and CPU s/GB per arm and load: one `RUN` line per measurement, then each
+/// arm's median, spread and median CPU.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn hits_at_256_kib_depth_2_are_as_fast_as_at_1_mib_depth_4() {
-    let shipped_dir = TempDir::new().unwrap();
-    let small_dir = TempDir::new().unwrap();
-    let shipped = warmed_proxy(&shipped_dir, MIB, 4).await;
-    let small = warmed_proxy(&small_dir, 256 * KIB, 2).await;
-    // One untimed run each, so connection setup and first reads are outside the comparison.
-    hit_throughput(shipped.addr).await;
-    hit_throughput(small.addr).await;
-
-    let (mut shipped_runs, mut small_runs) = (Vec::new(), Vec::new());
-    for _ in 0..ROUNDS {
-        shipped_runs.push(hit_throughput(shipped.addr).await);
-        small_runs.push(hit_throughput(small.addr).await);
+#[ignore = "a measurement: run by hand with --ignored --nocapture"]
+async fn hit_throughput_per_arm() {
+    let arms = arms();
+    let rounds = rounds();
+    let loads = [
+        ("small", SMALL_OBJECT, SMALL_CLIENTS, SMALL_REQUESTS),
+        ("large", LARGE_OBJECT, LARGE_CLIENTS, LARGE_REQUESTS),
+    ];
+    let mut dirs = Vec::new();
+    let mut proxies = Vec::new();
+    for _ in &arms {
+        let mut per_load = Vec::new();
+        for (_, size, _, _) in loads {
+            let dir = TempDir::new().unwrap();
+            per_load.push(warmed_proxy(&dir, size).await);
+            dirs.push(dir);
+        }
+        proxies.push(per_load);
     }
-    let (shipped_mbps, small_mbps) = (median(shipped_runs.clone()), median(small_runs.clone()));
-    println!(
-        "THROUGHPUT clients={CLIENTS} requests={REQUESTS} object={OBJECT_SIZE} \
-         1MiB/4 median={shipped_mbps:.0} MB/s runs={shipped_runs:.0?} \
-         256KiB/2 median={small_mbps:.0} MB/s runs={small_runs:.0?} ratio={:.3}",
-        small_mbps / shipped_mbps
-    );
-    assert!(
-        small_mbps >= 0.97 * shipped_mbps,
-        "256 KiB / depth 2 served {small_mbps:.0} MB/s against {shipped_mbps:.0} MB/s"
-    );
+    // One untimed run per arm and load, so connection setup and first reads are outside the
+    // figures.
+    for (a, arm) in arms.iter().enumerate() {
+        apply_arm(arm);
+        for (l, (_, size, clients, requests)) in loads.iter().enumerate() {
+            hit_throughput(proxies[a][l].addr, *size, *clients, *requests).await;
+        }
+    }
+    let mut runs = vec![vec![(Vec::new(), Vec::new()); loads.len()]; arms.len()];
+    for round in 0..rounds {
+        for (a, arm) in arms.iter().enumerate() {
+            apply_arm(arm);
+            for (l, (load, size, clients, requests)) in loads.iter().enumerate() {
+                let (mbps, cpu) =
+                    hit_throughput(proxies[a][l].addr, *size, *clients, *requests).await;
+                println!(
+                    "RUN round={round} arm={} load={load} mbps={mbps:.0} cpu_s_per_gb={cpu:.3}",
+                    arm.label()
+                );
+                runs[a][l].0.push(mbps);
+                runs[a][l].1.push(cpu);
+            }
+        }
+    }
+    for (a, arm) in arms.iter().enumerate() {
+        for (l, (load, size, clients, requests)) in loads.iter().enumerate() {
+            let (mbps, cpu) = &runs[a][l];
+            let mut sorted = mbps.clone();
+            sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            println!(
+                "THROUGHPUT arm={} load={load} clients={clients} requests={requests} \
+                 object={size} median={:.0} MB/s min={:.0} max={:.0} cpu_s_per_gb={:.3}",
+                arm.label(),
+                median(mbps.clone()),
+                sorted[0],
+                sorted[sorted.len() - 1],
+                median(cpu.clone())
+            );
+            assert!(median(mbps.clone()) > 0.0);
+        }
+    }
 }
